@@ -44,11 +44,16 @@ jobs:
       run: |
         xcodebuild -workspace HeliPort.xcworkspace -scheme HeliPort -configuration Release -derivedDataPath build CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO | xcpretty && exit ${PIPESTATUS[0]}
     
+    - name: Prepere Upload
+      run: |
+         cd build/Build/Products/Release
+         ditto -c -k --sequesterRsrc --keepParent HeliPort.app HeliPort.zip 
+   
     - name: Upload a Build Artifact
       uses: actions/upload-artifact@v2
       with:
         path:
-          ./build/Build/Products/Release/*.app
+          ./build/Build/Products/Release/HeliPort.zip
 
     - name: Release Build
       if: github.event_name == 'push' && contains(github.event.head_commit.message, 'GH release')
