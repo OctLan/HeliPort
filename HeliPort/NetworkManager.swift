@@ -29,49 +29,18 @@ final class NetworkManager {
 
     class func connect(networkInfo: NetworkInfo, saveNetwork: Bool = false,
                        _ callback: ((_ result: Bool) -> Void)? = nil) {
-        guard !networkInfo.isConnected else {
-            return
-        }
 
         guard supportedSecurityMode.contains(networkInfo.auth.security) else {
-            let alert = NSAlert()
-            alert.messageText = NSLocalizedString("Network security not supported: ", comment: "")
-                + networkInfo.auth.security.description
-            alert.alertStyle = NSAlert.Style.critical
-            DispatchQueue.main.async {
-                alert.runModal()
-            }
+            let alert = Alert(text: NSLocalizedString("Network security not supported: ")
+                + networkInfo.auth.security.description)
+            alert.show()
             return
         }
 
         let getAuthInfoCallback: (_ auth: NetworkAuth, _ savePassword: Bool) -> Void = { auth, savePassword in
-            var networkInfoStruct = network_info_t()
-            strncpy(
-                &networkInfoStruct.SSID.0,
-                networkInfo.ssid,
-                Int(MAX_SSID_LENGTH)
-            )
-            networkInfoStruct.is_connected = false
-            networkInfoStruct.RSSI = Int32(networkInfo.rssi)
-
-            networkInfoStruct.auth.security = auth.security.rawValue
-            networkInfoStruct.auth.option = auth.option
-            networkInfoStruct.auth.identity = UnsafeMutablePointer<UInt8>.allocate(capacity: auth.identity.count)
-            networkInfoStruct.auth.identity.initialize(
-                from: &auth.identity,
-                count: auth.identity.count
-            )
-            networkInfoStruct.auth.identity_length = UInt32(auth.identity.count)
-            networkInfoStruct.auth.username = UnsafeMutablePointer<Int8>(
-                mutating: (auth.username as NSString).utf8String
-            )
-            networkInfoStruct.auth.password = UnsafeMutablePointer<Int8>(
-                mutating: (auth.password as NSString).utf8String
-            )
-
             DispatchQueue.global(qos: .background).async {
                 StatusBarIcon.connecting()
-                let result = connect_network(&networkInfoStruct)
+                let result = connect_network(networkInfo.ssid, auth.password)
                 DispatchQueue.main.async {
                     if result {
                         if savePassword {
@@ -83,21 +52,25 @@ final class NetworkManager {
             }
         }
 
-        if let savedNetworkAuth = CredentialsManager.instance.get(networkInfo) {
-            networkInfo.auth = savedNetworkAuth
-            Log.debug("Connecting to network \(networkInfo.ssid) with saved password")
-            getAuthInfoCallback(networkInfo.auth, false)
-            return
-        }
+        // Getting keychain access blocks UI Thread and makes everything freeze unless made async
+        DispatchQueue.global().async {
+            if let savedNetworkAuth = CredentialsManager.instance.get(networkInfo) {
+                networkInfo.auth = savedNetworkAuth
+                Log.debug("Connecting to network \(networkInfo.ssid) with saved password")
+                CredentialsManager.instance.setAutoJoin(networkInfo.ssid, true)
+                getAuthInfoCallback(networkInfo.auth, false)
+                return
+            }
 
-        guard networkInfo.auth.security != ITL80211_SECURITY_NONE,
-            networkInfo.auth.password.isEmpty else {
-            getAuthInfoCallback(networkInfo.auth, saveNetwork)
-            return
-        }
+            guard networkInfo.auth.security != ITL80211_SECURITY_NONE,
+                networkInfo.auth.password.isEmpty else {
+                getAuthInfoCallback(networkInfo.auth, saveNetwork)
+                return
+            }
 
-        DispatchQueue.main.async {
-            WifiPopupWindow(networkInfo: networkInfo, getAuthInfoCallback: getAuthInfoCallback).show()
+            DispatchQueue.main.async {
+                WifiPopupWindow(networkInfo: networkInfo, getAuthInfoCallback: getAuthInfoCallback).show()
+            }
         }
     }
 
@@ -110,8 +83,10 @@ final class NetworkManager {
             let networks = Mirror(reflecting: list.networks).children.map({ $0.value }).prefix(Int(list.count))
 
             for element in networks {
-                var network = element as? network_info_t
-                let ssid = String(cString: &network!.SSID.0)
+                guard var network = element as? ioctl_network_info else {
+                    continue
+                }
+                let ssid = String(cString: &network.ssid.0)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                     .replacingOccurrences(of: "[\n,\r]*", with: "", options: .regularExpression)
                 guard !ssid.isEmpty else {
@@ -120,16 +95,14 @@ final class NetworkManager {
 
                 let networkInfo = NetworkInfo(
                     ssid: ssid,
-                    connected: network!.is_connected,
-                    rssi: Int(network!.RSSI)
+                    rssi: Int(network.rssi)
                 )
-                networkInfo.auth.security = itl80211_security(rawValue: network?.auth.security ?? 0)
-                networkInfo.auth.option = network?.auth.option ?? 0
+                networkInfo.auth.security = getSecurityType(network)
                 result.insert(networkInfo)
             }
 
             DispatchQueue.main.async {
-                callback(Array(result).sorted { $0.ssid < $1.ssid }.sorted { $0.isConnected && !$1.isConnected })
+                callback(Array(result).sorted { $0.ssid < $1.ssid })
             }
         }
     }
@@ -190,7 +163,7 @@ final class NetworkManager {
         return addressBytes.joined(separator: separator)
     }
 
-    class func checkConnectionReachability(station: station_info_t) -> Bool {
+    class func isReachable() -> Bool {
         guard let reachability = SCNetworkReachabilityCreateWithName(nil, "www.apple.com") else {
             return false
         }
@@ -209,23 +182,28 @@ final class NetworkManager {
     }
 
     class func getRouterAddress(bsd: String) -> String? {
-        let dynamicCreate = SCDynamicStoreCreate(kCFAllocatorDefault, "router-ip" as CFString, nil, nil)
-        let keyIPv4 = "State:/Network/Global/IPv4" as CFString
-        let keyIPv6 = "State:/Network/Global/IPv6" as CFString
-        let dictionary = SCDynamicStoreCopyValue(dynamicCreate, keyIPv4)
-            ?? SCDynamicStoreCopyValue(dynamicCreate, keyIPv6)
+        // from Goshin
+        let ipAddressRegex = #"\s([a-fA-F0-9\.:]+)(\s|%)"# // for ipv4 and ipv6
 
-        guard let interface = dictionary?[kSCDynamicStorePropNetPrimaryInterface] as? String, interface == bsd else {
-            Log.error("Could not find interface")
+        let routerCommand = ["netstat -rn | egrep -o default.*\(bsd)"]
+        guard let routerOutput = commandLine(args: routerCommand) else {
             return nil
         }
 
-        guard let ipRouterAddr = dictionary?["Router"] as? String else {
-            Log.error("Could not find router ip")
-            return nil
+        let regex = try? NSRegularExpression.init(pattern: ipAddressRegex, options: [])
+        let firstMatch = regex?.firstMatch(in: routerOutput,
+                                        options: [],
+                                        range: NSRange(location: 0, length: routerOutput.count))
+        if let range = firstMatch?.range(at: 1) {
+            if let swiftRange = Range(range, in: routerOutput) {
+                let ipAddr = String(routerOutput[swiftRange])
+                return ipAddr
+            }
+        } else {
+            print("Could not find router ip address")
         }
 
-        return ipRouterAddr
+        return nil
     }
 
     // from https://stackoverflow.com/questions/30748480/swift-get-devices-wifi-ip-address/30754194#30754194
@@ -272,5 +250,70 @@ final class NetworkManager {
 
         // ipV4 has priority
         return ipV4 ?? ipV6
+    }
+
+    class func getSecurityType(_ info: ioctl_network_info) -> itl80211_security {
+        if info.supported_rsnprotos & ITL80211_PROTO_RSN.rawValue != 0 {
+            //wpa2
+            if info.rsn_akms & ITL80211_AKM_8021X.rawValue != 0 {
+                if info.supported_rsnprotos & ITL80211_PROTO_WPA.rawValue != 0 {
+                    return ITL80211_SECURITY_WPA_ENTERPRISE_MIXED
+                }
+                return ITL80211_SECURITY_WPA2_ENTERPRISE
+            } else if info.rsn_akms & ITL80211_AKM_PSK.rawValue != 0 {
+                if info.supported_rsnprotos & ITL80211_PROTO_WPA.rawValue != 0 {
+                    return ITL80211_SECURITY_WPA_PERSONAL_MIXED
+                }
+                return ITL80211_SECURITY_WPA2_PERSONAL
+            } else if info.rsn_akms & ITL80211_AKM_SHA256_8021X.rawValue != 0 {
+                return ITL80211_SECURITY_WPA2_ENTERPRISE
+            } else if info.rsn_akms & ITL80211_AKM_SHA256_PSK.rawValue != 0 {
+                return ITL80211_SECURITY_PERSONAL
+            }
+        } else if info.supported_rsnprotos & ITL80211_PROTO_WPA.rawValue != 0 {
+            //wpa
+            if info.rsn_akms & ITL80211_AKM_8021X.rawValue != 0 {
+                return ITL80211_SECURITY_WPA_ENTERPRISE
+            } else if info.rsn_akms & ITL80211_AKM_PSK.rawValue != 0 {
+                return ITL80211_SECURITY_WPA_PERSONAL
+            } else if info.rsn_akms & ITL80211_AKM_SHA256_8021X.rawValue != 0 {
+                return ITL80211_SECURITY_WPA_ENTERPRISE
+            } else if info.rsn_akms & ITL80211_AKM_SHA256_PSK.rawValue != 0 {
+                return ITL80211_SECURITY_ENTERPRISE
+            }
+        } else if info.supported_rsnprotos == 0 {
+            return ITL80211_SECURITY_NONE
+        }
+        //TODO wpa3
+        return ITL80211_SECURITY_UNKNOWN
+    }
+}
+
+extension NetworkManager {
+
+    // Util for running commands
+    static func commandLine(args: [String]) -> String? {
+        let process = Process()
+        if #available(OSX 10.13, *) {
+            process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        } else {
+            process.launchPath = "/bin/sh"
+        }
+        process.arguments = ["-l", "-c"] + args
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        if #available(OSX 10.13, *) {
+            try? process.run()
+        } else {
+            process.launch()
+        }
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: data, encoding: .utf8),
+            !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        return output.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

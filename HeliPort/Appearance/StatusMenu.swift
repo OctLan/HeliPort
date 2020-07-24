@@ -32,11 +32,15 @@ final class StatusMenu: NSMenu, NSMenuDelegate {
 
     private var status: itl_80211_state = ITL80211_S_INIT {
         didSet {
-            guard isNetworkCardEnabled else {
+            /* Only allow if network card is enabled or if the network card does not load
+             either due to itlwm not loaded or just not able to receive info
+             This prevents cards that are working but are "off" to not change the
+             Status from "WiFi off" to another status. i.e "WiFi: on". */
+            guard isNetworkCardEnabled || !isNetworkCardAvailable else {
                 return
             }
 
-            statusItem.title = NSLocalizedString(status.description, comment: "")
+            statusItem.title = NSLocalizedString(status.description)
 
             switch status {
             case ITL80211_S_INIT:
@@ -45,9 +49,14 @@ final class StatusMenu: NSMenu, NSMenuDelegate {
                 StatusBarIcon.connecting()
             case ITL80211_S_RUN:
                 DispatchQueue.global(qos: .background).async {
+                    let isReachable = NetworkManager.isReachable()
                     var staInfo = station_info_t()
                     get_station_info(&staInfo)
                     DispatchQueue.main.async {
+                        guard isReachable else {
+                            StatusBarIcon.warning()
+                            return
+                        }
                         StatusBarIcon.signalStrength(RSSI: staInfo.rssi)
                     }
                 }
@@ -55,38 +64,70 @@ final class StatusMenu: NSMenu, NSMenuDelegate {
                 // no change in status bar icon when scanning
                 break
             default:
-                StatusBarIcon.off()
+                StatusBarIcon.error()
             }
         }
     }
-
-    private var networkItemList = [NSMenuItem]()
-
-    private let maxNetworkListLength = MAX_NETWORK_LIST_LENGTH
-    private let networkItemListSeparator: NSMenuItem = {
-        let networkItemListSeparator =  NSMenuItem.separator()
-        networkItemListSeparator.isHidden = true
-        return networkItemListSeparator
-    }()
 
     private var showAllOptions: Bool = false {
         willSet(visible) {
-            for idx in 0...6 {
-                items[idx].isHidden = !visible
-            }
-            for idx in 1...2 {
-                items[items.count - idx].isHidden = !visible
-            }
-            for idx in 11...24 {
-                // TODO: security, country code, and NSS are hidden since those have not been implemented in io_station_info
-                if idx == 15 || idx == 18 || idx == 24 {
-                    items[idx].isHidden = true
-                    continue
-                }
-                items[idx].isHidden = !(visible && status == ITL80211_S_RUN)
-            }
+            let hiddenItems: [NSMenuItem] = [
+                bsdItem,
+                macItem,
+                itlwmVerItem,
+                enableLoggingItem,
+                createReportItem,
+                diagnoseItem,
+                hardwareInfoSeparator,
+
+                toggleLaunchItem,
+                checkUpdateItem,
+                quitSeparator,
+                quitItem
+            ]
+
+            let connectedNetworkInfoItems: [NSMenuItem] = [
+                disconnectItem,
+                ipAddresssItem,
+                routerItem,
+                internetItem,
+                securityItem,
+                bssidItem,
+                channelItem,
+                countryCodeItem,
+                rssiItem,
+                noiseItem,
+                txRateItem,
+                phyModeItem,
+                mcsIndexItem,
+                nssItem
+            ]
+
+            let enabledNetworkCardItems: [NSMenuItem] = [
+                createNetworkItem,
+                manuallyJoinItem
+            ]
+
+            let notImplementedItems: [NSMenuItem] = [
+                enableLoggingItem,
+                createReportItem,
+                diagnoseItem,
+
+                securityItem,
+                countryCodeItem,
+                nssItem,
+
+                createNetworkItem
+            ]
+
+            for item in hiddenItems { item.isHidden = !visible }
+            for item in enabledNetworkCardItems { item.isHidden = !isNetworkCardAvailable }
+            for item in connectedNetworkInfoItems { item.isHidden = !(visible && status == ITL80211_S_RUN) }
+            for item in notImplementedItems { item.isHidden = true }
         }
     }
+
+    private var isNetworkConnected: Bool = false
 
     private var isNetworkListEmpty: Bool = true {
         willSet(empty) {
@@ -103,10 +144,18 @@ final class StatusMenu: NSMenu, NSMenuDelegate {
         }
     }
 
+    private var isNetworkCardAvailable: Bool = true {
+        willSet(newState) {
+            if !newState {
+                self.isNetworkCardEnabled = false
+            }
+        }
+    }
+
     private var isNetworkCardEnabled: Bool = false {
         willSet(newState) {
-            statusItem.title = NSLocalizedString(newState ? "Wi-Fi: On" : "Wi-Fi: Off", comment: "")
-            switchItem.title = NSLocalizedString(newState ? "Turn Wi-Fi Off" : "Turn Wi-Fi On", comment: "")
+            statusItem.title = NSLocalizedString(newState ? "Wi-Fi: On" : "Wi-Fi: Off")
+            switchItem.title = NSLocalizedString(newState ? "Turn Wi-Fi Off" : "Turn Wi-Fi On")
             if newState != isNetworkCardEnabled {
                 newState ? StatusBarIcon.on() : StatusBarIcon.off()
                 self.isNetworkListEmpty = true
@@ -122,38 +171,61 @@ final class StatusMenu: NSMenu, NSMenuDelegate {
 
     // - MARK: Menu items
 
-    private let statusItem = NSMenuItem(title: NSLocalizedString("Wi-Fi: Status unavailable", comment: ""))
+    private let statusItem = NSMenuItem(title: NSLocalizedString("Wi-Fi: Status unavailable"))
     private let switchItem = NSMenuItem(
-        title: NSLocalizedString("Turn Wi-Fi On", comment: ""),
+        title: NSLocalizedString("Turn Wi-Fi On"),
         action: #selector(clickMenuItem(_:))
     )
-    private let bsdItem = NSMenuItem(title: NSLocalizedString("Interface Name: ", comment: "") + "(null)")
-    private let macItem = NSMenuItem(title: NSLocalizedString("Address: ", comment: "") + "(null)")
-    private let itlwmVerItem = NSMenuItem(title: NSLocalizedString("Version: ", comment: "") + "(null)")
+    private let bsdItem = NSMenuItem(title: NSLocalizedString("Interface Name: ") + "(null)")
+    private let macItem = NSMenuItem(title: NSLocalizedString("Address: ") + "(null)")
+    private let itlwmVerItem = NSMenuItem(title: NSLocalizedString("Version: ") + "(null)")
+
+    private let enableLoggingItem = NSMenuItem(title: NSLocalizedString("Enable Wi-Fi Logging"))
+    private let createReportItem = NSMenuItem(title: NSLocalizedString("Create Diagnostics Report..."))
+    private let diagnoseItem = NSMenuItem(title: NSLocalizedString("Open Wireless Diagnostics..."))
+    private let hardwareInfoSeparator = NSMenuItem.separator()
+
+    private var networkItemList = [NSMenuItem]()
+    private let maxNetworkListLength = MAX_NETWORK_LIST_LENGTH
+    private let networkItemListSeparator: NSMenuItem = {
+        let networkItemListSeparator =  NSMenuItem.separator()
+        networkItemListSeparator.isHidden = true
+        return networkItemListSeparator
+    }()
+
+    private let manuallyJoinItem = NSMenuItem(title: NSLocalizedString("Join Other Network..."))
+    private let createNetworkItem = NSMenuItem(title: NSLocalizedString("Create Network..."))
+    private let networkPanelItem = NSMenuItem(title: NSLocalizedString("Open Network Preferences..."))
+
+    private let aboutItem = NSMenuItem(title: NSLocalizedString("About HeliPort"))
+    private let checkUpdateItem = NSMenuItem(title: NSLocalizedString("Check for Updates..."))
+    private let quitSeparator = NSMenuItem.separator()
+    private let quitItem = NSMenuItem(title: NSLocalizedString("Quit HeliPort"),
+                                      action: #selector(clickMenuItem(_:)), keyEquivalent: "q")
 
     private let toggleLaunchItem = NSMenuItem(
-        title: NSLocalizedString("Launch At Login", comment: ""),
+        title: NSLocalizedString("Launch At Login"),
         action: #selector(clickMenuItem(_:))
     )
 
     // MARK: - WiFi connected items
 
     let disconnectItem = NSMenuItem(
-        title: NSLocalizedString("Disconnect from: ", comment: "") + "(null)",
+        title: NSLocalizedString("Disconnect from: ") + "(null)",
         action: #selector(disassociateSSID(_:)))
-    private let ipAddresssItem = NSMenuItem(title: NSLocalizedString("    IP Address: ", comment: "") + "(null)")
-    private let routerItem = NSMenuItem(title: NSLocalizedString("    Router: ", comment: "") + "(null)")
-    private let internetItem = NSMenuItem(title: NSLocalizedString("    Internet: ", comment: "") + "(null)")
-    private let securityItem = NSMenuItem(title: NSLocalizedString("    Security: ", comment: "") + "(null)")
-    private let bssidItem = NSMenuItem(title: NSLocalizedString("    BSSID: ", comment: "") + "(null)")
-    private let channelItem = NSMenuItem(title: NSLocalizedString("    Channel: ", comment: "") + "(null)")
-    private let countryCodeItem = NSMenuItem(title: NSLocalizedString("    Country Code: ", comment: "") + "(null)")
-    private let rssiItem = NSMenuItem(title: NSLocalizedString("    RSSI: ", comment: "") + "(null)")
-    private let noiseItem = NSMenuItem(title: NSLocalizedString("    Noise: ", comment: "") + "(null)")
-    private let txRateItem = NSMenuItem(title: NSLocalizedString("    Tx Rate: ", comment: "") + "(null)")
-    private let phyModeItem = NSMenuItem(title: NSLocalizedString("    PHY Mode: ", comment: "") + "(null)")
-    private let mcsIndexItem = NSMenuItem(title: NSLocalizedString("    MCS Index: ", comment: "") + "(null)")
-    private let nssItem = NSMenuItem(title: NSLocalizedString("    NSS: ", comment: "") + "(null)")
+    private let ipAddresssItem = NSMenuItem(title: NSLocalizedString("    IP Address: ") + "(null)")
+    private let routerItem = NSMenuItem(title: NSLocalizedString("    Router: ") + "(null)")
+    private let internetItem = NSMenuItem(title: NSLocalizedString("    Internet: ") + "(null)")
+    private let securityItem = NSMenuItem(title: NSLocalizedString("    Security: ") + "(null)")
+    private let bssidItem = NSMenuItem(title: NSLocalizedString("    BSSID: ") + "(null)")
+    private let channelItem = NSMenuItem(title: NSLocalizedString("    Channel: ") + "(null)")
+    private let countryCodeItem = NSMenuItem(title: NSLocalizedString("    Country Code: ") + "(null)")
+    private let rssiItem = NSMenuItem(title: NSLocalizedString("    RSSI: ") + "(null)")
+    private let noiseItem = NSMenuItem(title: NSLocalizedString("    Noise: ") + "(null)")
+    private let txRateItem = NSMenuItem(title: NSLocalizedString("    Tx Rate: ") + "(null)")
+    private let phyModeItem = NSMenuItem(title: NSLocalizedString("    PHY Mode: ") + "(null)")
+    private let mcsIndexItem = NSMenuItem(title: NSLocalizedString("    MCS Index: ") + "(null)")
+    private let nssItem = NSMenuItem(title: NSLocalizedString("    NSS: ") + "(null)")
 
     // - MARK: Init
 
@@ -165,14 +237,8 @@ final class StatusMenu: NSMenu, NSMenuDelegate {
         getDeviceInfo()
 
         DispatchQueue.global(qos: .default).async {
-            var powerState: Bool = false
-            let get_power_ret = get_power_state(&powerState)
-            DispatchQueue.main.async {
-                if get_power_ret {
-                    self.isNetworkCardEnabled = powerState
-                    self.updateNetworkList()
-                }
-            }
+            self.updateStatus()
+            self.updateNetworkList()
 
             self.isAutoLaunch = LoginItemManager.isEnabled()
 
@@ -200,11 +266,11 @@ final class StatusMenu: NSMenu, NSMenuDelegate {
         addItem(macItem)
         addItem(itlwmVerItem)
 
-        addClickItem(title: NSLocalizedString("Enable Wi-Fi Logging", comment: ""))
-        addClickItem(title: NSLocalizedString("Create Diagnostics Report...", comment: ""))
-        addClickItem(title: NSLocalizedString("Open Wireless Diagnostics...", comment: ""))
+        addClickItem(enableLoggingItem)
+        addClickItem(createReportItem)
+        addClickItem(diagnoseItem)
 
-        addItem(NSMenuItem.separator())
+        addItem(hardwareInfoSeparator)
 
         addItem(statusItem)
         addItem(switchItem)
@@ -235,18 +301,18 @@ final class StatusMenu: NSMenu, NSMenuDelegate {
 
         addItem(networkItemListSeparator)
 
-        addClickItem(title: NSLocalizedString("Join Other Network...", comment: ""))
-        addClickItem(title: NSLocalizedString("Create Network...", comment: ""))
-        addClickItem(title: NSLocalizedString("Open Network Preferences...", comment: ""))
+        addClickItem(manuallyJoinItem)
+        addClickItem(createNetworkItem)
+        addClickItem(networkPanelItem)
 
         addItem(NSMenuItem.separator())
 
-        // TODO: Move this option into the settings window once it's implemented
-        addItem(toggleLaunchItem)
-        toggleLaunchItem.target = self
-        addClickItem(title: NSLocalizedString("About HeliPort", comment: ""))
-        addClickItem(title: NSLocalizedString("Check for Updates...", comment: ""))
-        addClickItem(title: NSLocalizedString("Quit HeliPort", comment: ""), keyEquivalent: "q")
+        addClickItem(toggleLaunchItem)
+        addClickItem(checkUpdateItem)
+        addClickItem(aboutItem)
+
+        addItem(quitSeparator)
+        addClickItem(quitItem)
     }
 
     // - MARK: Overrides
@@ -265,6 +331,8 @@ final class StatusMenu: NSMenu, NSMenuDelegate {
 
         let queue = DispatchQueue.global(qos: .default)
         queue.async {
+            self.updateNetworkInfo()
+            self.updateNetworkList()
             self.networkListUpdateTimer = Timer.scheduledTimer(
                 timeInterval: self.networkListUpdatePeriod,
                 target: self,
@@ -284,19 +352,17 @@ final class StatusMenu: NSMenu, NSMenuDelegate {
 
     // - MARK: Actions
 
-    private func addClickItem(title: String, keyEquivalent: String = "") {
-        addItem(
-            withTitle: title,
-            action: #selector(clickMenuItem(_:)),
-            keyEquivalent: keyEquivalent
-        ).target = self
+    private func addClickItem(_ item: NSMenuItem) {
+        item.target = self
+        item.action = #selector(clickMenuItem(_:))
+        addItem(item)
     }
 
     private func getDeviceInfo() {
         DispatchQueue.global(qos: .background).async {
-            var bsdName = NSLocalizedString("Unavailable", comment: "")
-            var macAddr = NSLocalizedString("Unavailable", comment: "")
-            var itlwmVer = NSLocalizedString("Unavailable", comment: "")
+            var bsdName = NSLocalizedString("Unavailable")
+            var macAddr = NSLocalizedString("Unavailable")
+            var itlwmVer = NSLocalizedString("Unavailable")
             var platformInfo = platform_info_t()
 
             if is_power_on() {
@@ -312,14 +378,18 @@ final class StatusMenu: NSMenu, NSMenuDelegate {
             }
 
             DispatchQueue.main.async {
-                self.bsdItem.title = NSLocalizedString("Interface Name: ", comment: "") + bsdName
-                self.macItem.title = NSLocalizedString("Address: ", comment: "") + macAddr
-                self.itlwmVerItem.title = NSLocalizedString("Version: ", comment: "") + itlwmVer
+                self.bsdItem.title = NSLocalizedString("Interface Name: ") + bsdName
+                self.macItem.title = NSLocalizedString("Address: ") + macAddr
+                self.itlwmVerItem.title = NSLocalizedString("Version: ") + itlwmVer
             }
 
             // If not connected, try to connect saved networks
             var stationInfo = station_info_t()
-            if get_station_info(&stationInfo) != KERN_SUCCESS {
+            var state: UInt32 = 0
+            var power: Bool = false
+            get_power_state(&power)
+            if get_80211_state(&state) && power &&
+                (state != ITL80211_S_RUN.rawValue || get_station_info(&stationInfo) != KERN_SUCCESS) {
                 NetworkManager.connectSavedNetworks()
             }
         }
@@ -332,11 +402,7 @@ final class StatusMenu: NSMenu, NSMenuDelegate {
             keyEquivalent: ""
         )
         item.view = WifiMenuItemView(
-            networkInfo: NetworkInfo(
-                ssid: "placeholder",
-                connected: false,
-                rssi: 0
-            )
+            networkInfo: NetworkInfo(ssid: "placeholder")
         )
         guard let view = item.view as? WifiMenuItemView else {
             return item
@@ -358,29 +424,27 @@ final class StatusMenu: NSMenu, NSMenuDelegate {
         Log.debug("Clicked \(sender.title)")
 
         switch sender.title {
-        case NSLocalizedString("Turn Wi-Fi On", comment: ""):
+        case NSLocalizedString("Turn Wi-Fi On"):
             power_on()
-        case NSLocalizedString("Turn Wi-Fi Off", comment: ""):
+        case NSLocalizedString("Turn Wi-Fi Off"):
             power_off()
-        case NSLocalizedString("Join Other Network...", comment: ""):
+        case NSLocalizedString("Join Other Network..."):
             let joinPop = JoinPopWindow()
             joinPop.show()
-        case NSLocalizedString("Create Network...", comment: ""):
-            let alert = NSAlert()
-            alert.messageText = NSLocalizedString("FUNCTION NOT IMPLEMENTED", comment: "")
-            alert.alertStyle = NSAlert.Style.critical
-            alert.runModal()
-        case NSLocalizedString("Open Network Preferences...", comment: ""):
+        case NSLocalizedString("Create Network..."):
+            let alert = Alert(text: NSLocalizedString("FUNCTION NOT IMPLEMENTED"))
+            alert.show()
+        case NSLocalizedString("Open Network Preferences..."):
             NSWorkspace.shared.openFile("/System/Library/PreferencePanes/Network.prefPane")
-        case NSLocalizedString("Check for Updates...", comment: ""):
+        case NSLocalizedString("Check for Updates..."):
             heliPortUpdater.checkForUpdates(self)
-        case NSLocalizedString("Launch At Login", comment: ""):
+        case NSLocalizedString("Launch At Login"):
             LoginItemManager.setStatus(enabled: LoginItemManager.isEnabled() ? false : true)
             isAutoLaunch = LoginItemManager.isEnabled()
-        case NSLocalizedString("About HeliPort", comment: ""):
+        case NSLocalizedString("About HeliPort"):
             NSApplication.shared.orderFrontStandardAboutPanel()
             NSApplication.shared.activate(ignoringOtherApps: true)
-        case NSLocalizedString("Quit HeliPort", comment: ""):
+        case NSLocalizedString("Quit HeliPort"):
             exit(0)
         default:
             Log.error("Invalid menu item clicked")
@@ -398,7 +462,9 @@ final class StatusMenu: NSMenu, NSMenuDelegate {
                 if get_power_ret {
                     self.isNetworkCardEnabled = powerState
                 }
+                self.isNetworkCardAvailable = get_power_ret
                 self.status = itl_80211_state(rawValue: status)
+                self.updateNetworkInfo()
             }
         }
     }
@@ -409,35 +475,37 @@ final class StatusMenu: NSMenu, NSMenuDelegate {
         }
 
         DispatchQueue.global(qos: .background).async {
-            var disconnectName = NSLocalizedString("Unavailable", comment: "")
-            var ipAddr = NSLocalizedString("Unavailable", comment: "")
-            var routerAddr = NSLocalizedString("Unavailable", comment: "")
-            var internet = NSLocalizedString("Unavailable", comment: "")
-            var security = NSLocalizedString("Unavailable", comment: "")
-            var bssid = NSLocalizedString("Unavailable", comment: "")
-            var channel = NSLocalizedString("Unavailable", comment: "")
-            var countryCode = NSLocalizedString("Unavailable", comment: "")
-            var rssi = NSLocalizedString("Unavailable", comment: "")
-            var noise = NSLocalizedString("Unavailable", comment: "")
-            var txRate = NSLocalizedString("Unavailable", comment: "")
-            var phyMode = NSLocalizedString("Unavailable", comment: "")
-            var mcsIndex = NSLocalizedString("Unavailable", comment: "")
-            var nss = NSLocalizedString("Unavailable", comment: "")
+            var disconnectName = NSLocalizedString("Unavailable")
+            var ipAddr = NSLocalizedString("Unavailable")
+            var routerAddr = NSLocalizedString("Unavailable")
+            var internet = NSLocalizedString("Unavailable")
+            var security = NSLocalizedString("Unavailable")
+            var bssid = NSLocalizedString("Unavailable")
+            var channel = NSLocalizedString("Unavailable")
+            var countryCode = NSLocalizedString("Unavailable")
+            var rssi = NSLocalizedString("Unavailable")
+            var noise = NSLocalizedString("Unavailable")
+            var txRate = NSLocalizedString("Unavailable")
+            var phyMode = NSLocalizedString("Unavailable")
+            var mcsIndex = NSLocalizedString("Unavailable")
+            var nss = NSLocalizedString("Unavailable")
+            self.isNetworkConnected = false
             var staInfo = station_info_t()
             if self.status == ITL80211_S_RUN && get_station_info(&staInfo) == KERN_SUCCESS {
+                self.isNetworkConnected = true
                 let bsd = String(self.bsdItem.title)
-                    .replacingOccurrences(of: NSLocalizedString("Interface Name: ", comment: ""),
+                    .replacingOccurrences(of: NSLocalizedString("Interface Name: "),
                                           with: "",
                                           options: .regularExpression,
                                           range: nil)
                 let ipAddress = NetworkManager.getLocalAddress(bsd: bsd)
                 let routerAddress = NetworkManager.getRouterAddress(bsd: bsd)
-                let isReachable = NetworkManager.checkConnectionReachability(station: staInfo)
+                let isReachable = NetworkManager.isReachable()
                 disconnectName = String(cString: &staInfo.ssid.0)
-                ipAddr = ipAddress ?? NSLocalizedString("Unknown", comment: "")
-                routerAddr = routerAddress ?? NSLocalizedString("Unknown", comment: "")
-                internet = NSLocalizedString(isReachable ? "Reachable" : "Unreachable", comment: "")
-                security = NSLocalizedString("Unknown", comment: "")
+                ipAddr = ipAddress ?? NSLocalizedString("Unknown")
+                routerAddr = routerAddress ?? NSLocalizedString("Unknown")
+                internet = NSLocalizedString(isReachable ? "Reachable" : "Unreachable")
+                security = NSLocalizedString("Unknown")
                 bssid = String(format: "%02x:%02x:%02x:%02x:%02x:%02x",
                                staInfo.bssid.0,
                                staInfo.bssid.1,
@@ -449,29 +517,42 @@ final class StatusMenu: NSMenu, NSMenuDelegate {
                 channel = String(staInfo.channel) + " (" +
                     (staInfo.channel <= 14 ? "2.4 GHz" : "5 GHz") + ", " +
                 "\(staInfo.band_width) MHz)"
-                countryCode = NSLocalizedString("Unknown", comment: "")
+                countryCode = NSLocalizedString("Unknown")
                 rssi = String(staInfo.rssi) + " dBm"
                 noise = String(staInfo.noise) + " dBm"
                 txRate = String(staInfo.rate) + " Mbps"
                 phyMode = staInfo.op_mode.description
                 mcsIndex = String(staInfo.cur_mcs)
-                nss = NSLocalizedString("Unknown", comment: "")
+                nss = NSLocalizedString("Unknown")
             }
             DispatchQueue.main.async {
-                self.disconnectItem.title = NSLocalizedString("Disconnect from: ", comment: "") + disconnectName
-                self.ipAddresssItem.title = NSLocalizedString("    IP Address: ", comment: "") + ipAddr
-                self.routerItem.title = NSLocalizedString("    Router: ", comment: "") + routerAddr
-                self.internetItem.title = NSLocalizedString("    Internet: ", comment: "") + internet
-                self.securityItem.title = NSLocalizedString("    Security: ", comment: "") + security
-                self.bssidItem.title = NSLocalizedString("    BSSID: ", comment: "") + bssid
-                self.channelItem.title = NSLocalizedString("    Channel: ", comment: "") + channel
-                self.countryCodeItem.title = NSLocalizedString("    Country Code: ", comment: "") + countryCode
-                self.rssiItem.title = NSLocalizedString("    RSSI: ", comment: "") + rssi
-                self.noiseItem.title = NSLocalizedString("    Noise: ", comment: "") + noise
-                self.txRateItem.title = NSLocalizedString("    Tx Rate: ", comment: "") + txRate
-                self.phyModeItem.title = NSLocalizedString("    PHY Mode: ", comment: "") + phyMode
-                self.mcsIndexItem.title = NSLocalizedString("    MCS Index: ", comment: "") + mcsIndex
-                self.nssItem.title = NSLocalizedString("    NSS: ", comment: "") + nss
+                self.disconnectItem.title = NSLocalizedString("Disconnect from: ") + disconnectName
+                self.ipAddresssItem.title = NSLocalizedString("    IP Address: ") + ipAddr
+                self.routerItem.title = NSLocalizedString("    Router: ") + routerAddr
+                self.internetItem.title = NSLocalizedString("    Internet: ") + internet
+                self.securityItem.title = NSLocalizedString("    Security: ") + security
+                self.bssidItem.title = NSLocalizedString("    BSSID: ") + bssid
+                self.channelItem.title = NSLocalizedString("    Channel: ") + channel
+                self.countryCodeItem.title = NSLocalizedString("    Country Code: ") + countryCode
+                self.rssiItem.title = NSLocalizedString("    RSSI: ") + rssi
+                self.noiseItem.title = NSLocalizedString("    Noise: ") + noise
+                self.txRateItem.title = NSLocalizedString("    Tx Rate: ") + txRate
+                self.phyModeItem.title = NSLocalizedString("    PHY Mode: ") + phyMode
+                self.mcsIndexItem.title = NSLocalizedString("    MCS Index: ") + mcsIndex
+                self.nssItem.title = NSLocalizedString("    NSS: ") + nss
+                guard self.isNetworkCardEnabled,
+                    let wifiItemView = self.networkItemList[0].view as? WifiMenuItemView else {
+                    return
+                }
+                wifiItemView.visible = self.isNetworkConnected
+                wifiItemView.connected = self.isNetworkConnected
+                if self.isNetworkConnected {
+                    self.isNetworkListEmpty = false
+                    wifiItemView.networkInfo = NetworkInfo(
+                        ssid: String(cString: &staInfo.ssid.0),
+                        rssi: Int(staInfo.rssi)
+                    )
+                }
             }
         }
     }
@@ -482,9 +563,9 @@ final class StatusMenu: NSMenu, NSMenuDelegate {
         }
 
         NetworkManager.scanNetwork { networkList in
-            self.isNetworkListEmpty = networkList.count == 0
+            self.isNetworkListEmpty = networkList.count == 0 && !self.isNetworkConnected
             var networkList = networkList
-            for index in 0 ..< self.networkItemList.count {
+            for index in 1 ..< self.networkItemList.count {
                 if let view = self.networkItemList[index].view as? WifiMenuItemView {
                     if networkList.count > 0 {
                         view.networkInfo = networkList.removeFirst()
@@ -494,17 +575,20 @@ final class StatusMenu: NSMenu, NSMenuDelegate {
                     }
                 }
             }
-            self.updateNetworkInfo()
         }
     }
 
     @objc func disassociateSSID(_ sender: NSMenuItem) {
         let ssid = String(sender.title)
-            .replacingOccurrences(of: NSLocalizedString("Disconnect from: ", comment: ""), with: "",
+            .replacingOccurrences(of: NSLocalizedString("Disconnect from: "), with: "",
                                   options: .regularExpression,
                                   range: nil
         )
-        dis_associate_ssid(ssid)
-        print("disconnected from \(ssid)")
+
+        DispatchQueue.global().async {
+            CredentialsManager.instance.setAutoJoin(ssid, false)
+            dis_associate_ssid(ssid)
+            print("disconnected from \(ssid)")
+        }
     }
 }
